@@ -5,12 +5,11 @@ use ethercat::{
 use ethercat_esi::EtherCatInfo;
 use std::{
     collections::HashMap,
-    // env,
     fs::File,
     io::{self, prelude::*},
-    thread,
     time::Duration,
 };
+use std::time::Instant;
 
 type BitLen = u8;
 
@@ -59,10 +58,16 @@ pub fn main() -> Result<(), io::Error> {
             );
         }
     }
-    let cycle_time = Duration::from_micros(50_000);
+    const CYCLE_TIME: Duration = Duration::from_micros(50_000);
     master.activate()?;
 
+    let entry_offsets = offsets.get(&SlavePos::from(0))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No offsets found for slave 0"))?;
+
     loop {
+        // 在循环开始处记录时间
+        let cycle_start = Instant::now();
+
         master.receive()?;
         master.domain(domain_idx).process()?;
         master.domain(domain_idx).queue()?;
@@ -72,12 +77,152 @@ pub fn main() -> Result<(), io::Error> {
         log::info!("Master state: {:?}", m_state);
         log::info!("Domain state: {:?}", d_state);
         if m_state.link_up && m_state.al_states == 8 {
-            let raw_data = master.domain_data(domain_idx);
+            let mut raw_data = master.domain_data(domain_idx)?;
             log::info!("{:?}", raw_data);
+
+            let read = true; // 假设我们要读取数据
+            let read_len: usize = 96; // 假设我们要读取96个字节
+            let op_entries = vec![
+                PdoEntryIdx { idx: 0x6000, sub_idx: 0x01 }, // 示例操作PDO
+                // 可以添加更多的操作PDO
+            ];
+            let write_bytes = vec![500u16; 6]; // 示例数据
+
+            // 使用存储的偏移量访问PDO数据
+            for (entry_idx, (_bit_len, offset)) in entry_offsets {
+                if !op_entries.contains(&entry_idx) {
+                    continue; // 跳过非操作PDO
+                }
+                if read {
+                    let values = read_pdo_data(&raw_data, entry_idx, &offset, read_len)
+                    .expect("Failed to read PDO data");
+                    // TODO: 处理读取的数据, callback
+                    break; // 只处理第一个操作PDO
+                }
+                // write PDO数据
+                write_pdo_data(&mut raw_data, entry_idx, &offset, &write_bytes)
+                    .expect("Failed to write PDO data");
+                // TODO: 处理写入的数据, callback, or not wait for response
+                break; // 只处理第一个操作PDO
+            }   
         }
-        thread::sleep(cycle_time);
+
+        // 循环结束处检查时间并等待
+        let elapsed = cycle_start.elapsed();
+        if elapsed < CYCLE_TIME {
+            std::thread::sleep(CYCLE_TIME - elapsed);
+        } else {
+            log::warn!("周期超时! 用时: {:?}, 周期时间: {:?}", elapsed, CYCLE_TIME);
+        }
+        // thread::sleep(cycle_time);
     }
+
+    // 5. 清理资源
+    #[allow(unreachable_code)]
+    master.deactivate()?;
+    // master.release()?;
 }
+
+// finger_ctrl_mode
+// #define CTRL_MODE_POS_TIME   0x01  // 位置 + 时间
+// #define CTRL_MODE_POS_SPD    0x02  // 位置 + 速度
+// #define CTRL_MODE_SPD        0x03  // 速度控制
+// #define CTRL_MODE_CURRENT    0x04  // 电流控制
+// #define CTRL_MODE_PWM        0x05  // PWM占空比
+
+// #[repr(C, packed)]
+// struct RevoRxPdo {
+//     multi_finger_ctrl_mode: u16, // TBD
+//     finger_param1: [i16; 6],
+//     finger_param2: [u16; 6],
+//     single_finger_ctrl_mode: u8, // 控制模式
+//     single_finger_id: u8,
+//     single_finger_param1: i16,
+//     single_finger_param2: u16,
+// }
+
+// #[repr(C, packed)]
+// struct RevoTxPdo {
+//     finger_pos: [u16; 6],
+//     finger_spd: [i16; 6],
+//     finger_cur: [i16; 6],
+//     finger_status: [u8; 6], // 状态字
+// }
+
+// // 安全地访问PDO数据
+// fn access_pdo_data(domain_data: &mut [u8]) {
+//     // 获取RX PDO的写入接口
+//     let rx_pdo = unsafe {
+//         &mut *(domain_data.as_mut_ptr() as *mut RevoRxPdo)
+//     };
+    
+//     // 设置控制模式
+//     rx_pdo.multi_finger_ctrl_mode = 1;
+//     rx_pdo.finger_param1 = [1000; 6]; // 初始化手指参数1
+//     rx_pdo.finger_param2 = [200; 6]; // 初始化手指参数2
+    
+//     // 获取TX PDO的读取接口
+//     let tx_pdo = unsafe {
+//         &*(domain_data.as_ptr().add(32) as *const RevoTxPdo)
+//     };
+    
+//     // 读取位置数据
+//     let positions = unsafe {
+//         std::slice::from_raw_parts(
+//             tx_pdo.finger_pos.as_ptr() as *const i32,
+//             3  // 假设有3个手指位置
+//         )
+//     };
+    
+//     println!("手指位置: {:?}", positions);
+// }
+
+fn read_pdo_data(
+    domain_data: &[u8],
+    entry: &PdoEntryIdx,
+    offset: &Offset,
+    byte_len: usize,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let (offset, _) = (offset.byte, offset.bit);
+    let values = domain_data.get(offset..offset + byte_len).ok_or(anyhow::anyhow!("Invalid offset"))?;
+    log::debug!("读取 Entry 0x{:#?}:{:?} = {:?}", entry.idx, entry.sub_idx, values);
+    Ok(values.to_vec())
+}
+
+fn write_pdo_data(
+    domain_data: &mut [u8],
+    entry: &PdoEntryIdx,
+    offset: &Offset,
+    bytes: &[u8],
+) -> Result<(), anyhow::Error> {
+    let (offset, _) = (offset.byte, offset.bit);
+    domain_data[offset..offset + bytes.len()].copy_from_slice(bytes);
+    log::debug!("写入 Entry 0x{:#?}:{:?} = {:?}", entry.idx, entry.sub_idx, &bytes);
+    Ok(())
+}
+
+// fn process_pdo_data(
+//     master: &mut Master,
+//     domain_idx: usize,
+//     entry_offsets: &[(EntryIndex, (u32, Offset))],
+//     r_or_w: bool,
+//     count: usize,
+//     bytes: &[u8],
+// ) -> Result<(), PdoError> {
+//     let byte_len = (*bit_len as usize + 7) / 8;
+//     match r_or_w {
+//         true => read_raw_bytes(data_slice, entry_idx, offset, byte_len)?,
+//         false => {
+//             let start = i * byte_len;
+//             write_raw_bytes(data_slice, entry_idx, offset, bytes.get(start..start + byte_len), byte_len)?
+//         }
+//     }
+// }
+
+
+
+
+
 
 type SlaveMap = HashMap<SlavePos, HashMap<PdoEntryIdx, (BitLen, Offset)>>;
 
