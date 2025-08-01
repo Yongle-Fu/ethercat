@@ -524,6 +524,12 @@ impl Master {
         Ok(time)
     }
 
+    pub fn select_reference_clock(&mut self, idx: SlavePos) -> Result<()> {
+        let index = u16::from(idx) as u32;
+        ioctl!(self, ec::ioctl::SELECT_REF_CLOCK, &index)?;
+        Ok(())
+    }
+
     pub fn foe_read(&mut self, idx: SlavePos, name: &str) -> Result<Vec<u8>> {
         let file_name = convert::string_to_foe_name(name)?;
         // FIXME: this is the same as in the c-implementation. Should read in chunks instead of a
